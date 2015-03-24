@@ -7,7 +7,6 @@ var through = require('through2');
 var minimist = require('minimist');
 var allContainers = require('docker-allcontainers');
 var statsFactory = require('docker-stats');
-var logFactory = require('docker-loghose');
 
 function connect(opts) {
   var stream;
@@ -30,10 +29,13 @@ function start(opts) {
   var logsToken = opts.logstoken || opts.token;
   var statsToken = opts.statstoken || opts.token;
   var out;
-  var noRestart = function() {};
-  var filter = through.obj(function(obj, enc, cb) {
-    addAll(opts.add, obj);
 
+  var ThrottleTime = opts.throttle || 5000;
+  
+  var noRestart = function() {};
+  var sendStream = through.obj(function(obj, enc, cb) {
+    addAll(opts.add, obj);
+    console.log('sending envent', obj.id)
     if (obj.line) {
       this.push(logsToken);
     } else {
@@ -45,26 +47,33 @@ function start(opts) {
     this.push('\n');
     cb()
   });
+
   var events = allContainers(opts);
   opts.events = events;
 
-  var loghose = logFactory(opts);
-  loghose.pipe(filter);
-
   if (opts.stats !== false) {
     var stats = statsFactory(opts);
-    stats.pipe(filter);
+    
+    var counts = {}; // { <docker_id>: last sceen event}
+    var throttle = through.obj(function(obj, enc, cb) {
+      var now = new Date().getTime();
+      var self = this;
+      function send() {
+        counts[obj.id] = new Date().getTime();
+        self.push(obj);
+      }
+      if (counts[obj.id] === undefined) {
+        send();
+      } else if (now - counts[obj.id] > ThrottleTime ) {
+        send();
+      }
+      
+      cb()
+    });
+    stats.pipe(throttle).pipe(sendStream);
   }
 
   pipe();
-
-  // destroy out if loghose is destroyed
-  eos(loghose, function() {
-    noRestart()
-    out.destroy();
-  });
-
-  return loghose;
 
   function addAll(proto, obj) {
     if (!proto) { return; }
@@ -79,12 +88,12 @@ function start(opts) {
 
   function pipe() {
     if (out) {
-      filter.unpipe(out);
+      sendStream.unpipe(out);
     }
 
     out = connect(opts);
 
-    filter.pipe(out, { end: false });
+    sendStream.pipe(out, { end: false });
 
     // automatically reconnect on socket failure
     noRestart = eos(out, pipe);
@@ -100,19 +109,21 @@ function cli() {
       'statstoken': 'k',
       'secure': 's',
       'json': 'j',
-      'add': 'a'
+      'add': 'a',
+      'throttle': 'h'
     },
     default: {
       json: false,
       stats: true,
-      add: []
+      add: [],
+      throttle: 5000
     }
   });
 
   if (!(argv.token || (argv.logstoken && argv.statstoken))) {
     console.log('Usage: docker-logentries [-l LOGSTOKEN] [-k STATSTOKEN]\n' +
                 '                         [-t TOKEN] [--secure] [--json]\n' +
-                '                         [--no-stats] [-a KEY=VALUE]');
+                '                         [--no-stats] [--throttle value] [-a KEY=VALUE]');
     process.exit(1);
   }
 
